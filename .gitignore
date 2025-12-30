@@ -1,0 +1,19 @@
+
+# Data & Cache
+TrainingData/
+sec-edgar-filings/
+cache/
+__pycache__/
+.ipynb_checkpoints/
+*.csv
+*.txt
+*.json
+
+# Large Models
+*.h5
+*.keras
+*.npy
+
+# Media
+videos/
+images/
