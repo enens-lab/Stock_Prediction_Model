@@ -1,0 +1,20 @@
+# Core Data Science
+numpy>=1.21.0
+pandas>=1.5.0
+scikit-learn>=1.0.0
+tqdm>=4.64.0
+
+# Deep Learning (AI)
+tensorflow>=2.10.0
+keras>=2.10.0
+torch>=1.13.0
+transformers>=4.25.0
+
+# Financial Data & Indicators
+yfinance>=0.2.0
+pandas_ta>=0.3.14b0
+pandas_market_calendars>=4.1.0
+
+# Web Scraping (Sentiment/SEC)
+requests>=2.28.0
+beautifulsoup4>=4.11.0
