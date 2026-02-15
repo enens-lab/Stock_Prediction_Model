@@ -21,7 +21,7 @@ PIPELINE = [
     
     # --- PHASE 3: TRAINING (The Gym) ---
     # Comment these out if you are happy with your current models and just want to trade!
-    ("train_production_model.py", "Training Production Model (Target: >2% in 5 Days)"),
+    ("train_model.py", "Training Production Model (Target: >2% in 5 Days)"),
     ("train_jackpot_model.py", "Training Jackpot Model (Target: >20% in 20 Days)"),
 ]
 
