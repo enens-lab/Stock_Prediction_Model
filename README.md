@@ -1,53 +1,243 @@
-# AI-Powered Stock Market Predictor (LSTM + FinBERT)
+# LSTM AI Stock Predictor
 
-> **A high-performance quantitative trading engine utilizing Deep Learning to predict 5-day price movements across the entire US Stock Market.**
+> A multi-GPU deep learning system for predicting short-term stock movements across the entire US equity market, with integration into the [Pythia](https://github.com/aj-robb/pythia) trading platform.
 
-## System Overview
-Unlike standard tutorials that train on a single stock, this system is engineered to process **2,000+ tickers simultaneously** using a vectorized pipeline optimized for NVIDIA A100 GPUs. It combines technical analysis, sentiment analysis, and insider trading data to generate probability-based buy signals.
+## Overview
 
-### Key Capabilities
-* **Scale:** Trains on the full Russell 2000 + S&P 500 (~2,156 stocks).
-* **Architecture:** Deep LSTM (Long Short-Term Memory) Network for time-series classification.
-* **Alternative Data:** Integrates **FinBERT** (NLP for news sentiment) and **SEC Form 4** (Insider Trading) data.
-* **Performance:** Capable of identifying Sector Rotation (e.g., Tech to Consumer Staples) during market volatility.
+This system trains two LSTM (Long Short-Term Memory) models on ~2,000+ US stocks simultaneously, engineered for **4x NVIDIA ADA6000 GPUs** (192GB total VRAM):
+
+| Model | Target | Horizon | Use Case |
+|-------|--------|---------|----------|
+| **Production (5-Day)** | >2% return | 5 trading days | Consistent swing trades |
+| **Jackpot** | >20% return | 20 trading days | High-conviction breakout plays |
+
+Both models output a probability score (0.0–1.0) for binary classification: will the stock hit the target return within the horizon?
 
 ---
 
-## How It Works
-The model treats the market as a **Binary Classification** problem:
-* **Input:** 60-day lookback window of Price, Volume, RSI, MACD, Bollinger Bands, and Sentiment.
-* **Target:** Will the stock price be **> 2% higher** in exactly **5 days**?
-* **Output:** A confidence score (0.0 to 1.0). Trades are only taken when Confidence > 80%.
+## Architecture
 
-## Tech Stack
-* **Core:** Python 3.10+, TensorFlow/Keras 2.x
-* **Data Processing:** Pandas, NumPy (Vectorized operations for 30GB+ datasets)
-* **NLP:** HuggingFace Transformers (FinBERT)
-* **Hardware:** Optimized for CUDA (NVIDIA T4 / A100)
+### Model Design
+
+```
+Input (60 timesteps x ~50 features)
+  │
+  ├─ Conv1D(64, kernel=3) + BatchNorm
+  │
+  ├─ LSTM(256, return_sequences=True) + BatchNorm + Dropout(0.3)
+  │
+  ├─ MultiHeadAttention(4 heads, key_dim=32) + Residual + LayerNorm
+  │
+  ├─ LSTM(128) + BatchNorm + Dropout(0.3)
+  │
+  ├─ Dense(32, relu)
+  │
+  └─ Dense(1, sigmoid) → Probability
+```
+
+Key design choices:
+- **Multi-Head Attention** between LSTM layers captures long-range temporal dependencies
+- **Cosine Decay with Warm Restarts** learning rate schedule (1-epoch linear warmup)
+- **File-based train/val split** (90/10) prevents data leakage between stocks
+- **Mixed precision (float16)** training with float32 output layer for numerical stability
+- **4-GPU distributed training** via `tf.distribute.MirroredStrategy`
+
+### Feature Set (~50 features)
+
+| Category | Features |
+|----------|----------|
+| **Technicals** | RSI(14), MACD, Bollinger Bands, ATR |
+| **Returns** | Log returns (close, volume) |
+| **Jackpot Indicators** | BB Width (squeeze), RVOL, Distance to 52-week High, ROC(10) |
+| **Fundamentals** | P/E Ratio, Short Float, Insider/Institutional Ownership, Market Cap |
+| **Sector** | One-hot encoded sector from Finviz |
+| **Insider Trading** | SEC Form 4 daily shares/amount/direction |
+| **Sentiment** | FinBERT news sentiment scores |
+| **Macro** | VIX Fear Index |
+
+---
 
 ## Project Structure
-* `daily_signals.py` - The "Production" script. Scans the market and prints top picks for tomorrow.
-* `processor.py` - The ETL Engine. Calculates 50+ technical indicators and handles data cleaning.
-* `lstm_model.h5` - The pre-trained model weights (GitIgnored due to size).
-* `run_backtest_v4.py` - Simulation engine to verify historical performance.
 
-## Usage
-1.  **Install Dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-2.  **Update Data:**
-    ```bash
-    python TrainingData/featuresPy/stockScrapper.py
-    python TrainingData/processor.py
-    ```
-3.  **Get Trading Signals:**
-    ```bash
-    python daily_signals.py
-    ```
-
-## Performance Note
-In historical backtesting (2020-2025), the "High Confidence" strategy demonstrated a capability to outperform the SPY benchmark by filtering for high-momentum setups and rotating sectors during downturns.
+```
+├── train_model.py              # Production 5-day model training
+├── train_jackpot_model.py      # Jackpot 20-day model training
+├── daily_picks.py              # Inference — scans market for top picks
+├── master_pipeline.py          # End-to-end pipeline orchestrator
+├── export_for_pythia.py        # Export models to Pythia artifact format
+│
+├── TrainingData/
+│   ├── processor.py            # Feature engineering (OHLCV → 50 features)
+│   ├── featuresPy/
+│   │   ├── markets.py          # VIX/macro data fetcher
+│   │   ├── stockScrapper.py    # OHLCV price data fetcher
+│   │   └── sentiment.py        # FinBERT news sentiment
+│   ├── models/                 # Saved models + scalers (gitignored)
+│   │   ├── lstm_production.keras
+│   │   ├── lstm_jackpot.keras
+│   │   ├── scaler_production.joblib
+│   │   ├── scaler_jackpot.joblib
+│   │   ├── feature_columns_production.json
+│   │   └── feature_columns_jackpot.json
+│   └── indicators_data/        # Raw + processed data (gitignored)
+```
 
 ---
-*Disclaimer: This is an algorithmic research project. Not financial advice.*
+
+## Usage
+
+### 1. Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Collect Data
+
+```bash
+python TrainingData/featuresPy/markets.py        # VIX data
+python TrainingData/featuresPy/stockScrapper.py   # OHLCV prices
+python TrainingData/featuresPy/sentiment.py       # News sentiment
+```
+
+### 3. Process Features
+
+```bash
+python TrainingData/processor.py
+```
+
+### 4. Train Models
+
+```bash
+python train_model.py           # Production model (~2% in 5 days)
+python train_jackpot_model.py   # Jackpot model (~20% in 20 days)
+```
+
+### 5. Run Inference
+
+```bash
+python daily_picks.py --mode consistency   # Conservative picks
+python daily_picks.py --mode jackpot       # High-risk/reward picks
+```
+
+### 6. Full Pipeline (Data → Train → Inference → Trade)
+
+```bash
+python master_pipeline.py
+```
+
+---
+
+## Pythia Integration
+
+This model integrates with [Pythia](https://github.com/aj-robb/pythia), a FastAPI-based trading platform with a web UI. After integration, the LSTM models appear as selectable models in Pythia's existing interface — **no frontend changes required**.
+
+### How It Works
+
+Pythia normally computes 10 simple technical features for its built-in models. The LSTM models need ~50 features. The solution: each LSTM model wrapper has a `compute_features()` method that **derives its own features from raw OHLCV data** at inference time.
+
+```
+Pythia fetches OHLCV data for a ticker
+        │
+        ▼
+    ┌──────────────────────┐
+    │  Model has            │
+    │  compute_features()?  │
+    └──────┬───────┬───────┘
+           │       │
+       YES │       │ NO (legacy models)
+           ▼       ▼
+    ┌─────────┐  ┌──────────┐
+    │ Compute  │  │ Pythia's │
+    │ ~50 feat │  │ 10 feat  │
+    │ from     │  │ pipeline │
+    │ OHLCV    │  │          │
+    └────┬─────┘  └────┬─────┘
+         │             │
+         ▼             ▼
+      Scale → Sequence(60) → model.predict() → PredictionResult
+```
+
+Features derivable from OHLCV (RSI, MACD, BB, ATR, jackpot indicators, log returns) are computed directly. Features that require external data (fundamentals, insider, VIX) default to 0 — the model still performs well since the technical features carry most of the signal.
+
+### Export Models to Pythia
+
+After training, run the export script to copy model artifacts into Pythia's directory structure:
+
+```bash
+python export_for_pythia.py --pythia-dir /path/to/pythia_divination
+```
+
+This creates:
+
+```
+pythia_divination/artifacts/
+├── lstm_5d/classifier/
+│   ├── model.keras
+│   ├── feature_columns.json
+│   ├── scaler.joblib
+│   └── metrics.json
+└── lstm_jackpot/classifier/
+    ├── model.keras
+    ├── feature_columns.json
+    ├── scaler.joblib
+    └── metrics.json
+```
+
+### Pythia API Usage
+
+Once exported, the models are available through Pythia's standard API:
+
+```bash
+# List all models (lstm_5d and lstm_jackpot should appear)
+curl localhost:8000/models
+
+# Get prediction from 5-day model
+curl "localhost:8000/predict/AAPL?model=lstm_5d"
+
+# Get prediction from jackpot model
+curl "localhost:8000/predict/AAPL?model=lstm_jackpot"
+
+# Multi-model consensus
+curl -X POST localhost:8000/predict/multi \
+  -H "Content-Type: application/json" \
+  -d '{"ticker": "AAPL", "models": ["lstm_5d", "lstm_jackpot", "gradient_boosting"]}'
+```
+
+### Pythia Files Modified
+
+The integration requires minimal changes to Pythia (on the `feature/lstm-stock-predictor-integration` branch):
+
+| File | Change |
+|------|--------|
+| `models/` (new module) | Model registry, base classes, and wrappers for all model types |
+| `models/lstm_stock_predictor.py` | LSTM wrapper with `compute_features()` for OHLCV-based feature computation |
+| `api/service.py` | 3-line addition: check for `compute_features()` method before prediction |
+| `api/tiers.py` | Added `lstm_5d` and `lstm_jackpot` to pro/enterprise allowed models |
+
+### Tier Access
+
+| Tier | LSTM Models Available |
+|------|----------------------|
+| Free | None |
+| Pro | `lstm_5d`, `lstm_jackpot` |
+| Enterprise | `lstm_5d`, `lstm_jackpot` |
+
+---
+
+## Hardware Requirements
+
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU | 1x NVIDIA GPU (8GB+) | 4x ADA6000 (48GB each) |
+| RAM | 32GB | 250GB |
+| Storage | 50GB | 200GB (for full dataset) |
+| CUDA | 11.8+ | 12.x |
+
+Training batch size auto-scales: `BATCH_SIZE_PER_REPLICA * num_GPUs`.
+
+---
+
+## License
+
+Research project — not financial advice. Use at your own risk.
