@@ -225,15 +225,6 @@ The integration requires minimal changes to Pythia (on the `feature/lstm-stock-p
 
 ---
 
-## Hardware Requirements
-
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| GPU | 1x NVIDIA GPU (8GB+) | 4x ADA6000 (48GB each) |
-| RAM | 32GB | 250GB |
-| Storage | 50GB | 200GB (for full dataset) |
-| CUDA | 11.8+ | 12.x |
-
 Training batch size auto-scales: `BATCH_SIZE_PER_REPLICA * num_GPUs`.
 
 ---
