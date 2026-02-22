@@ -7,7 +7,6 @@ from tensorflow.keras.layers import (
     Input, MultiHeadAttention, LayerNormalization, Add
 )
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras import mixed_precision
 from sklearn.preprocessing import StandardScaler
 from pathlib import Path
 import glob
@@ -17,6 +16,7 @@ import json
 import random
 import joblib
 from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 
 # --- 0. FORCE GPU DETECTION & SETUP ---
 physical_devices = tf.config.list_physical_devices('GPU')
@@ -41,10 +41,9 @@ CONFIG = {
     "PRED_HORIZON": 5,
     "BATCH_SIZE": GLOBAL_BATCH_SIZE,
     "EPOCHS": 60,
+    "CHUNK_SIZE": 700,  # Process files in chunks to prevent OOM
 }
 os.makedirs(CONFIG["MODEL_DIR"], exist_ok=True)
-
-#mixed_precision.set_global_policy('mixed_float16')
 
 print(f"Starting PRODUCTION Training (Global Batch Size: {CONFIG['BATCH_SIZE']})...")
 
@@ -62,104 +61,120 @@ print(f"Total Files: {len(all_files)}")
 print(f"   Train Files: {len(train_files)}")
 print(f"   Val Files:   {len(val_files)} (Strictly Unseen)")
 
-# --- 2. FEATURE LOCKING ---
+# --- 2. FEATURE LOCKING (ROBUST) ---
 print("Establishing Feature Schema...")
-first_df = pd.read_csv(train_files[0])
-cols_to_drop = ['date', 'target_5d', 'open', 'high', 'low', 'close', 'volume', 'ticker', 'target']
-saved_feature_cols = [c for c in first_df.columns if c not in cols_to_drop]
 
-print(f"LOCKED Features ({len(saved_feature_cols)}):")
+# Sample multiple files to find most common feature set
+print("Sampling files to detect consistent feature set...")
+sample_files = random.sample(train_files, min(50, len(train_files)))
+feature_sets = []
+
+for f in sample_files:
+    try:
+        df = pd.read_csv(f, nrows=1)
+        cols_to_drop = ['date', 'target_5d', 'target_20d', 'open', 'high', 'low', 'close', 'volume', 'ticker', 'target']
+        features = [c for c in df.columns if c not in cols_to_drop]
+        feature_sets.append(tuple(sorted(features)))
+    except:
+        continue
+
+# Find most common feature set
+feature_counter = Counter(feature_sets)
+most_common_features, count = feature_counter.most_common(1)[0]
+saved_feature_cols = list(most_common_features)
+
+print(f"LOCKED Features ({len(saved_feature_cols)}): (found in {count}/{len(sample_files)} sample files)")
 print(f"   {saved_feature_cols[:5]} ...")
 
 with open(CONFIG["FEATURE_MAP_PATH"], "w") as f_json:
     json.dump(saved_feature_cols, f_json)
 
-# --- 3. PARALLEL DATA LOADER (ThreadPoolExecutor) ---
+n_features = len(saved_feature_cols)
+
+# --- 3. OPTIMIZED PARALLEL DATA LOADER ---
 def process_single_file(f, feature_cols, config):
     try:
         df = pd.read_csv(f)
+        
         if len(df) < config["SEQ_LEN"] + config["PRED_HORIZON"]:
             return None, None
-
-        df_features = df.reindex(columns=feature_cols, fill_value=0)
-        df_features = df_features.replace([np.inf, -np.inf], np.nan).fillna(0)
-
-        scaler = StandardScaler()
-        X_raw = scaler.fit_transform(df_features.values).astype(np.float16)
-
+        
+        # Check if we have the pre-computed target
         if 'target_5d' in df.columns:
-            targets = df['target_5d'].fillna(0).astype(np.int8).values
-        else:
+            # Use pre-computed target from processor
+            targets = df['target_5d'].astype(np.int8).values
+        elif 'close' in df.columns:
+            # Fallback: compute target on the fly
             close = df['close'].values
             future_close = np.roll(close, -config["PRED_HORIZON"])
             returns = (future_close - close) / close
             returns[-config["PRED_HORIZON"]:] = 0
             targets = (returns > 0.02).astype(np.int8)
-
+        else:
+            return None, None
+        
+        df_features = df.reindex(columns=feature_cols, fill_value=0)
+        df_features = df_features.replace([np.inf, -np.inf], np.nan).fillna(0)
+        
+        scaler = StandardScaler()
+        X_raw = scaler.fit_transform(df_features.values).astype(np.float32)
+        
         X_local = []
         y_local = []
         limit = len(X_raw) - config["PRED_HORIZON"]
-
+        
         for i in range(config["SEQ_LEN"], limit):
             X_local.append(X_raw[i-config["SEQ_LEN"]:i])
             y_local.append(targets[i])
-
+        
         return X_local, y_local
     except Exception:
         return None, None
 
-def load_files_parallel(files, feature_cols, config, desc="Loading"):
-    print(f"{desc} ({len(files)} files)...")
+def load_chunk_parallel(files, feature_cols, config):
+    """Load a chunk of files in parallel"""
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
         futures = [executor.submit(process_single_file, f, feature_cols, config) for f in files]
         results = [fut.result() for fut in futures]
-
+    
     X_all, y_all = [], []
     for X_part, y_part in results:
         if X_part is not None and len(X_part) > 0:
             X_all.extend(X_part)
             y_all.extend(y_part)
-
+    
     if not X_all:
-        raise ValueError(f"No valid data extracted from {desc} files.")
-
-    X = np.array(X_all, dtype=np.float16)
+        return None, None
+    
+    X = np.array(X_all, dtype=np.float32)
     y = np.array(y_all, dtype=np.int8)
     del X_all, y_all, results
     gc.collect()
     return X, y
 
-# --- LOAD DATA ---
-X_train, y_train = load_files_parallel(train_files, saved_feature_cols, CONFIG, "Training Data")
-print(f"Training Data Ready: {X_train.shape}")
-
-X_val, y_val = load_files_parallel(val_files, saved_feature_cols, CONFIG, "Validation Data")
+# --- 4. LOAD VALIDATION DATA ---
+print("Loading Validation Data...")
+X_val, y_val = load_chunk_parallel(val_files, saved_feature_cols, CONFIG)
 print(f"Validation Data Ready: {X_val.shape}")
 
-# --- 4. TF DATASET PIPELINE ---
-shuffle_buffer = min(len(X_train), 2_000_000)
-
-train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train))
-train_ds = train_ds.cache() \
-                   .shuffle(buffer_size=shuffle_buffer) \
-                   .batch(CONFIG["BATCH_SIZE"]) \
-                   .prefetch(tf.data.AUTOTUNE)
-
 val_ds = tf.data.Dataset.from_tensor_slices((X_val, y_val))
-val_ds = val_ds.cache() \
-               .batch(CONFIG["BATCH_SIZE"]) \
-               .prefetch(tf.data.AUTOTUNE)
+val_ds = val_ds.batch(CONFIG["BATCH_SIZE"]).prefetch(tf.data.AUTOTUNE)
 
-# Auto-sharding for multi-GPU
-options = tf.data.Options()
-options.experimental_distribute.auto_shard_policy = tf.data.experimental.AutoShardPolicy.DATA
-train_ds = train_ds.with_options(options)
-val_ds = val_ds.with_options(options)
+# --- 5. CHUNKED TRAINING APPROACH ---
+num_chunks = max(1, len(train_files) // CONFIG["CHUNK_SIZE"])
+train_file_chunks = np.array_split(train_files, num_chunks)
 
-# --- 5. CLASS WEIGHTS ---
-pos = np.sum(y_train)
-neg = len(y_train) - pos
-total = len(y_train)
+print(f"Training files split into {len(train_file_chunks)} chunks of ~{CONFIG['CHUNK_SIZE']} files each")
+
+# Load first chunk for initialization
+print("Loading first training chunk for initialization...")
+X_chunk, y_chunk = load_chunk_parallel(train_file_chunks[0], saved_feature_cols, CONFIG)
+print(f"First chunk: {X_chunk.shape}")
+
+# --- 6. CLASS WEIGHTS ---
+pos = np.sum(y_chunk)
+neg = len(y_chunk) - pos
+total = len(y_chunk)
 
 if pos > 0:
     weight_0 = (1 / neg) * (total / 2.0)
@@ -170,9 +185,14 @@ else:
 class_weight = {0: weight_0, 1: weight_1}
 print(f"Class Weights -> 0: {weight_0:.2f} | 1: {weight_1:.2f}")
 
-# --- 6. LEARNING RATE SCHEDULE (Cosine Decay with Warmup) ---
-steps_per_epoch = max(1, len(X_train) // CONFIG["BATCH_SIZE"])
+# Estimate total samples
+samples_per_chunk = len(X_chunk)
+total_train_samples = samples_per_chunk * len(train_file_chunks)
+steps_per_epoch = max(1, total_train_samples // CONFIG["BATCH_SIZE"])
+print(f"Estimated total training samples: ~{total_train_samples:,}")
+print(f"Steps per epoch: {steps_per_epoch}")
 
+# --- 7. LEARNING RATE SCHEDULE ---
 class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, warmup_steps, total_decay_steps, initial_lr=1e-3, warmup_start_lr=1e-5,
                  t_mul=2.0, m_mul=0.9):
@@ -203,21 +223,19 @@ class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
             "warmup_start_lr": self.warmup_start_lr,
         }
 
-warmup_steps = steps_per_epoch  # 1 epoch warmup
+warmup_steps = steps_per_epoch
 cosine_decay_steps = steps_per_epoch * 5
 
 lr_schedule = WarmupCosineDecay(
     warmup_steps=warmup_steps,
     total_decay_steps=cosine_decay_steps,
-    initial_lr=5e-4,        # Changed from 1e-3
-    warmup_start_lr=1e-6,   # Changed from 1e-5
+    initial_lr=5e-4,
+    warmup_start_lr=1e-6,
 )
 
-# --- 7. MODEL ARCHITECTURE (Functional API for Attention) ---
-n_features = X_train.shape[2]
-
+# --- 8. MODEL ARCHITECTURE ---
 with strategy.scope():
-    print("Building Distributed Model...")
+    print("Building Distributed PRODUCTION Model...")
     inputs = Input(shape=(CONFIG["SEQ_LEN"], n_features))
 
     # Conv1D Feature Extraction
@@ -245,42 +263,130 @@ with strategy.scope():
 
     model = Model(inputs=inputs, outputs=outputs)
 
-    # Around line 197, replace the optimizer line:
-    opt = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0)  # Add gradient clipping
+    opt = tf.keras.optimizers.Adam(learning_rate=lr_schedule, clipnorm=1.0)
     model.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy', 'AUC'])
 
 model.summary()
 
-# --- 8. TRAINING ---
-print("Training PRODUCTION MODEL...")
-history = model.fit(
-    train_ds,
-    validation_data=val_ds,
-    epochs=CONFIG["EPOCHS"],
-    callbacks=[
-        EarlyStopping(patience=15, restore_best_weights=True, monitor='val_loss'),
-        ModelCheckpoint(CONFIG["MODEL_PATH"], save_best_only=True, monitor='val_loss')
-    ],
-    class_weight=class_weight
-)
+# --- 9. CUSTOM TRAINING LOOP WITH CHUNKED DATA ---
+print("\nTraining PRODUCTION MODEL with Chunked Data Loading...")
 
-print(f"PRODUCTION MODEL SAVED: {CONFIG['MODEL_PATH']}")
+best_val_loss = float('inf')
+patience_counter = 0
+patience = 15
 
-# --- 9. SAVE SCALER (for Pythia export) ---
-print("Fitting and saving global scaler...")
+for epoch in range(CONFIG["EPOCHS"]):
+    print(f"\n{'='*60}")
+    print(f"Epoch {epoch + 1}/{CONFIG['EPOCHS']}")
+    print(f"{'='*60}")
+    
+    # Shuffle chunks for this epoch
+    random.shuffle(train_file_chunks)
+    
+    epoch_loss = []
+    epoch_acc = []
+    epoch_auc = []
+    
+    # Train on each chunk
+    for chunk_idx, file_chunk in enumerate(train_file_chunks):
+        print(f"\n  Chunk {chunk_idx + 1}/{len(train_file_chunks)} ", end="", flush=True)
+        
+        # Load chunk
+        X_chunk, y_chunk = load_chunk_parallel(file_chunk, saved_feature_cols, CONFIG)
+        
+        if X_chunk is None:
+            continue
+        
+        # Create dataset for this chunk
+        chunk_ds = tf.data.Dataset.from_tensor_slices((X_chunk, y_chunk))
+        chunk_ds = chunk_ds.shuffle(buffer_size=min(len(X_chunk), 100_000)) \
+                           .batch(CONFIG["BATCH_SIZE"]) \
+                           .prefetch(tf.data.AUTOTUNE)
+        
+        # Train on chunk
+        history = model.fit(
+            chunk_ds,
+            epochs=1,
+            verbose=2,
+            class_weight=class_weight
+        )
+        
+        epoch_loss.append(history.history['loss'][0])
+        epoch_acc.append(history.history['accuracy'][0])
+        epoch_auc.append(history.history['AUC'][0])
+        
+        # Clean up
+        del X_chunk, y_chunk, chunk_ds
+        gc.collect()
+    
+    # Epoch metrics
+    avg_loss = np.mean(epoch_loss)
+    avg_acc = np.mean(epoch_acc)
+    avg_auc = np.mean(epoch_auc)
+    
+    print(f"\n  Train - Loss: {avg_loss:.4f}, Acc: {avg_acc:.4f}, AUC: {avg_auc:.4f}")
+    
+    # Validation
+    print("  Validating...", end="", flush=True)
+    val_results = model.evaluate(val_ds, verbose=0)
+    val_loss, val_acc, val_auc = val_results[0], val_results[1], val_results[2]
+    
+    print(f"\n  Val - Loss: {val_loss:.4f}, Acc: {val_acc:.4f}, AUC: {val_auc:.4f}")
+    
+    # Early stopping and checkpointing (using val_loss)
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        patience_counter = 0
+        model.save(CONFIG["MODEL_PATH"])
+        print(f"  ✓ New best model saved! (Loss: {val_loss:.4f})")
+    else:
+        patience_counter += 1
+        print(f"  No improvement (patience: {patience_counter}/{patience})")
+    
+    if patience_counter >= patience:
+        print(f"\n  Early stopping triggered!")
+        break
+
+print(f"\n{'='*60}")
+print(f"PRODUCTION MODEL TRAINING COMPLETE!")
+print(f"Best Validation Loss: {best_val_loss:.4f}")
+print(f"Model saved: {CONFIG['MODEL_PATH']}")
+print(f"{'='*60}")
+
+# --- 10. SAVE SCALER ---
+print("\nFitting and saving global scaler...")
 sample_files = random.sample(all_files, min(200, len(all_files)))
 scaler_data = []
+successful = 0
+failed = 0
+
 for f in sample_files:
     try:
         df = pd.read_csv(f)
+        # Use the same feature columns that were locked during training
         df_feat = df.reindex(columns=saved_feature_cols, fill_value=0)
         df_feat = df_feat.replace([np.inf, -np.inf], np.nan).fillna(0)
-        scaler_data.append(df_feat.values)
-    except Exception:
+        
+        # Ensure all columns are numeric and match expected count
+        df_feat = df_feat.select_dtypes(include=[np.number])
+        
+        # CRITICAL: Only use if it matches our locked feature count
+        if df_feat.shape[1] == len(saved_feature_cols):
+            scaler_data.append(df_feat.values)
+            successful += 1
+        else:
+            failed += 1
+    except Exception as e:
+        failed += 1
         continue
 
-scaler_array = np.concatenate(scaler_data, axis=0)
-global_scaler = StandardScaler()
-global_scaler.fit(scaler_array)
-joblib.dump(global_scaler, CONFIG["SCALER_PATH"])
-print(f"Global scaler saved: {CONFIG['SCALER_PATH']}")
+print(f"  Scaler samples: {successful} successful, {failed} failed")
+
+if scaler_data:
+    scaler_array = np.concatenate(scaler_data, axis=0)
+    global_scaler = StandardScaler()
+    global_scaler.fit(scaler_array)
+    joblib.dump(global_scaler, CONFIG["SCALER_PATH"])
+    print(f"✓ Global scaler saved: {CONFIG['SCALER_PATH']}")
+else:
+    print("⚠ Warning: No data available for scaler fitting.")
