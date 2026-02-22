@@ -7,7 +7,7 @@ def download_yahoo_daily(tickers, save_folder="TrainingData/indicators_data/raw/
     if not os.path.exists(save_folder):
         os.makedirs(save_folder)
 
-    print(f"Starting download for {len(tickers)} tickers using Yahoo Finance...")
+    print(f"Starting Smart Update for {len(tickers)} tickers...")
     
     batch_size = 50
     
@@ -15,88 +15,128 @@ def download_yahoo_daily(tickers, save_folder="TrainingData/indicators_data/raw/
         raw_batch = tickers[i:i+batch_size]
         print(f"Processing batch {i} to {i+len(raw_batch)}...")
         
-        # --- THE FIX ---
-        # 1. Clean whitespace/uppercase
-        # 2. Replace '/' with '-' (BRK/B -> BRK-B)
-        # 3. Replace '.' with '-' (BRK.B -> BRK-B) <--- CRITICAL FIX FOR YAHOO
-        batch = []
+        # 1. Clean Tickers
+        batch_clean = []
         for t in raw_batch:
             clean_t = t.strip().upper().replace('/', '-').replace('.', '-')
             if clean_t:
-                batch.append(clean_t)
+                batch_clean.append(clean_t)
         
-        if not batch: continue
+        if not batch_clean: continue
 
-        try:
-            # Added auto_adjust=True (Fixes the Warning AND handles stock splits better)
-            data = yf.download(batch, period="max", group_by='ticker', 
-                               threads=True, progress=False, auto_adjust=True)
-        except Exception as e:
-            print(f"   Batch failed: {e}")
-            continue
+        # 2. SPLIT: Who is New? Who is Existing?
+        # We process them separately to optimize speed.
+        existing_tickers = []
+        new_tickers = []
+        
+        for t in batch_clean:
+            file_path = os.path.join(save_folder, f"{t}_daily.csv")
+            if os.path.exists(file_path):
+                existing_tickers.append(t)
+            else:
+                new_tickers.append(t)
 
-        for ticker in batch:
+        # --- PROCESS EXISTING (Update Mode) ---
+        if existing_tickers:
             try:
-                # Extract dataframe
-                if len(batch) > 1:
-                    # Check if ticker exists in columns (handling yfinance multi-index weirdness)
-                    if ticker not in data.columns.get_level_values(0):
-                        print(f"   No data found for {ticker}")
-                        continue
-                    df = data[ticker].copy()
-                else:
-                    df = data.copy()
-
-                if df.empty:
-                    continue
-
-                # Clean columns
-                df.reset_index(inplace=True)
-                df.columns = [c.lower() for c in df.columns]
-                
-                # Standardize Date
-                if 'date' not in df.columns and 'datetime' not in df.columns:
-                     for col in df.columns:
-                         if 'date' in col.lower():
-                             df.rename(columns={col: 'date'}, inplace=True)
-                             break
-                
-                # Ensure we have a date column
-                if 'date' not in df.columns:
-                    continue
-
-                # Keep required columns
-                # Note: With auto_adjust=True, 'adj close' becomes 'close' automatically
-                required_cols = ['date', 'open', 'high', 'low', 'close', 'volume']
-                available_cols = [c for c in required_cols if c in df.columns]
-                df = df[available_cols]
-
-                # Format Date
-                df['date'] = pd.to_datetime(df['date']).dt.strftime('%Y-%m-%d')
-                df.sort_values('date', inplace=True)
-                
-                # Remove rows with NaN in critical columns
-                df.dropna(subset=['close'], inplace=True)
-
-                # Save
-                save_path = os.path.join(save_folder, f"{ticker}_daily.csv")
-                df.to_csv(save_path, index=False)
-
+                # We download 1y buffer to be safe (covers weekends/holidays/gaps)
+                # This is much faster than 'max'
+                data = yf.download(existing_tickers, period="1y", group_by='ticker', 
+                                   threads=True, progress=False, auto_adjust=True)
+                process_batch_data(data, existing_tickers, save_folder, is_update=True)
             except Exception as e:
-                # print(f"Error processing {ticker}: {e}") # Optional: uncomment for verbose debug
-                pass
-        
-        # Polite sleep to avoid rate limits
+                print(f"Update Batch failed: {e}")
+
+        # --- PROCESS NEW (Full History Mode) ---
+        if new_tickers:
+            print(f"   Found {len(new_tickers)} new tickers. Downloading full history...")
+            try:
+                data = yf.download(new_tickers, period="max", group_by='ticker', 
+                                   threads=True, progress=False, auto_adjust=True)
+                process_batch_data(data, new_tickers, save_folder, is_update=False)
+            except Exception as e:
+                print(f"New Ticker Batch failed: {e}")
+
+        # Polite sleep
         time.sleep(1)
 
     print("All downloads complete!")
+
+def process_batch_data(data, tickers, save_folder, is_update):
+    """
+    Handles the cleaning, merging, and saving logic.
+    """
+    for ticker in tickers:
+        try:
+            # EXTRACT DATAFRAME
+            if len(tickers) > 1:
+                # Handle MultiIndex
+                if ticker not in data.columns.get_level_values(0):
+                    continue
+                df_new = data[ticker].copy()
+            else:
+                df_new = data.copy()
+
+            if df_new.empty: continue
+
+            # CLEANUP
+            df_new.reset_index(inplace=True)
+            df_new.columns = [c.lower() for c in df_new.columns]
+            
+            # Standardize Date Column Name
+            if 'date' not in df_new.columns:
+                for col in df_new.columns:
+                    if 'date' in col.lower():
+                        df_new.rename(columns={col: 'date'}, inplace=True)
+                        break
+            
+            if 'date' not in df_new.columns: continue
+
+            # Filter Cols (STRICT FILTERING)
+            required_cols = ['date', 'open', 'high', 'low', 'close', 'volume']
+            # Only keep columns that actually exist in new data
+            final_cols = [c for c in required_cols if c in df_new.columns]
+            df_new = df_new[final_cols]
+
+            # Format Date
+            df_new['date'] = pd.to_datetime(df_new['date']).dt.strftime('%Y-%m-%d')
+            df_new.dropna(subset=['close'], inplace=True)
+
+            # SAVE / MERGE LOGIC
+            save_path = os.path.join(save_folder, f"{ticker}_daily.csv")
+            
+            if is_update and os.path.exists(save_path):
+                # Load Old
+                df_old = pd.read_csv(save_path)
+                
+                # --- FIX FOR WARNING ---
+                # Ensure Old DF has exactly the same columns as New DF
+                # This prevents 'FutureWarning' about mismatching columns
+                df_old = df_old[final_cols]
+                
+                # Concat Old + New (Now they match perfectly)
+                df_final = pd.concat([df_old, df_new])
+                
+                # Deduplicate
+                df_final.drop_duplicates(subset='date', keep='last', inplace=True)
+                df_final.sort_values('date', inplace=True)
+                
+                # Save
+                df_final.to_csv(save_path, index=False)
+            else:
+                # Just Save
+                df_new.sort_values('date', inplace=True)
+                df_new.to_csv(save_path, index=False)
+
+        except Exception as e:
+            # print(f"Error on {ticker}: {e}")
+            pass
 
 if __name__ == "__main__":
     list_path = os.path.join('TrainingData', 'stockList.csv')
     
     if os.path.exists(list_path):
         with open(list_path, 'r') as file:
-            # Read and filter empty lines
             tickers = [line.strip() for line in file if line.strip()]
         
         if tickers:
