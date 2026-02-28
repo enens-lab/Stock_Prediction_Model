@@ -1,11 +1,10 @@
 """
-Processor V7 (Advanced):
+Processor V7 (Advanced) - FIXED VERSION
 NEW ADDITIONS:
 - Options Flow Integration (Put/Call ratio, UOA)
 - Short Squeeze Score (combines short float + price action + volume)
 - Enhanced Momentum (multiple timeframes)
 - Volume Profile (buying vs selling pressure)
-- Dark Pool Index (institutional accumulation proxy)
 
 Existing:
 - Technicals (RSI, MACD, BB, ATR)
@@ -17,26 +16,84 @@ Existing:
 """
 
 import os
+import logging
 import pandas as pd
 import numpy as np
-#import pandas_ta as ta
 import warnings
 from tqdm import tqdm
 
 # --- CONFIG ---
 warnings.filterwarnings('ignore')
+logging.basicConfig(
+    filename='processor_errors.log',
+    level=logging.WARNING,
+    format='%(asctime)s %(levelname)s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
 
-RAW_DIR = "TrainingData/indicators_data/raw"
-PROCESSED_DIR = "TrainingData/indicators_data/processed"
-FUNDAMENTALS_PATH = "TrainingData/indicators_data/raw/finviz_fundamentals.csv"
+# Detect if we're running from TrainingData directory or project root
+if os.path.exists("indicators_data/raw"):
+    RAW_DIR = "indicators_data/raw"
+    PROCESSED_DIR = "indicators_data/processed"
+    FUNDAMENTALS_PATH = "indicators_data/raw/finviz_fundamentals.csv"
+    VIX_PATH = "indicators_data/raw/SPY-VIX/^VIX_daily.csv"
+else:
+    RAW_DIR = "TrainingData/indicators_data/raw"
+    PROCESSED_DIR = "TrainingData/indicators_data/processed"
+    FUNDAMENTALS_PATH = "TrainingData/indicators_data/raw/finviz_fundamentals.csv"
+    VIX_PATH = "TrainingData/indicators_data/raw/SPY-VIX/^VIX_daily.csv"
+
 STOCKS_DATA_DIR = os.path.join(RAW_DIR, "stocksData")
 OPTIONS_DIR = os.path.join(RAW_DIR, "optionsFlow")
 SENTIMENT_DIR = os.path.join(RAW_DIR, "sentiment")
 
-# Global Data Paths
-VIX_PATH = "TrainingData/indicators_data/raw/SPY-VIX/^VIX_daily.csv"
-
 os.makedirs(PROCESSED_DIR, exist_ok=True)
+
+print(f"Using RAW_DIR: {RAW_DIR}")
+print(f"STOCKS_DATA_DIR: {STOCKS_DATA_DIR}")
+print(f"Exists: {os.path.exists(STOCKS_DATA_DIR)}")
+if os.path.exists(STOCKS_DATA_DIR):
+    num_files = len([f for f in os.listdir(STOCKS_DATA_DIR) if f.endswith('.csv')])
+    print(f"Found {num_files} raw CSV files\n")
+
+# --- MANUAL TECHNICAL INDICATORS (No pandas_ta needed) ---
+
+def calculate_rsi(series, period=14):
+    """Calculate RSI manually."""
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_macd(series, fast=12, slow=26, signal=9):
+    """Calculate MACD manually."""
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return macd_line, signal_line, histogram
+
+def calculate_bollinger_bands(series, period=20, std_dev=2):
+    """Calculate Bollinger Bands manually."""
+    sma = series.rolling(window=period).mean()
+    std = series.rolling(window=period).std()
+    upper = sma + (std * std_dev)
+    lower = sma - (std * std_dev)
+    bandwidth = (upper - lower) / sma
+    percent_b = (series - lower) / (upper - lower)
+    return lower, sma, upper, bandwidth, percent_b
+
+def calculate_atr(high, low, close, period=14):
+    """Calculate ATR manually."""
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr
 
 def load_global_context():
     """Loads VIX (Fear Index) from markets.py data."""
@@ -46,7 +103,7 @@ def load_global_context():
         df_vix = pd.read_csv(VIX_PATH)
         if isinstance(df_vix.columns, pd.MultiIndex): 
             df_vix.columns = df_vix.columns.get_level_values(0)
-        df_vix.columns = [c.lower() for c in df_vix.columns]
+        df_vix.columns = [c.lower() for c in df_vix.columns]  # FIXED: was df.columns
         if 'date' not in df_vix.columns and 'Date' in df_vix.columns: 
             df_vix.rename(columns={'Date': 'date'}, inplace=True)
         df_vix['date'] = pd.to_datetime(df_vix['date']).dt.tz_localize(None)
@@ -158,8 +215,8 @@ def calculate_short_squeeze_score(df, short_float):
         vol_score = 0.0
     
     # Component 4: Technical Breakout (price above BB upper)
-    if 'BBU_20_2.0' in df.columns:
-        breakout_score = (df['close'] > df['BBU_20_2.0']).astype(float)
+    if 'BBU_20_2.0_2.0' in df.columns:
+        breakout_score = (df['close'] > df['BBU_20_2.0_2.0']).astype(float)
     else:
         breakout_score = 0.0
     
@@ -311,13 +368,25 @@ def process_file(csv_path, output_path, df_fundamentals, sector_cols, df_global_
             for col in all_fund_cols: 
                 df[col] = 0.0
 
-        # 3. Technicals
-        df["rsi"] = ta.rsi(df["close"], length=14)
-        macd = ta.macd(df["close"])
-        if macd is not None: df = pd.concat([df, macd], axis=1)
-        bb = ta.bbands(df["close"], length=20)
-        if bb is not None: df = pd.concat([df, bb], axis=1)
-        df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=14)
+        # 3. Technicals (Manual - No pandas_ta)
+        df["rsi"] = calculate_rsi(df["close"], period=14)
+        
+        # MACD
+        macd_line, signal_line, histogram = calculate_macd(df["close"])
+        df["MACD_12_26_9"] = macd_line
+        df["MACDs_12_26_9"] = signal_line
+        df["MACDh_12_26_9"] = histogram
+        
+        # Bollinger Bands
+        bb_lower, bb_mid, bb_upper, bb_bandwidth, bb_percent = calculate_bollinger_bands(df["close"])
+        df["BBL_20_2.0_2.0"] = bb_lower
+        df["BBM_20_2.0_2.0"] = bb_mid
+        df["BBU_20_2.0_2.0"] = bb_upper
+        df["BBB_20_2.0_2.0"] = bb_bandwidth
+        df["BBP_20_2.0_2.0"] = bb_percent
+        
+        # ATR
+        df["atr"] = calculate_atr(df["high"], df["low"], df["close"], period=14)
         
         # Returns
         df["YesterdayCloseLogR"] = np.log(df["close"] / df["close"].shift(1))
@@ -383,8 +452,12 @@ def process_file(csv_path, output_path, df_fundamentals, sector_cols, df_global_
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.dropna(inplace=True)
         
-        # Drop raw OHLCV to save space (keep close for reference)
-        cols_to_drop = ['open', 'high', 'low', 'volume']
+        # Drop raw OHLCV to save space (keep close for reference).
+        # Also drop static fundamentals scraped from Finviz: they represent today's values
+        # stamped across all historical rows, introducing look-ahead bias into training.
+        # Sector dummies (sec_*) are retained — sector membership is stable and not forward-looking.
+        STATIC_FUNDAMENTAL_COLS = ['pe_ratio', 'short_float', 'insider_own', 'inst_own', 'market_cap']
+        cols_to_drop = ['open', 'high', 'low', 'volume'] + STATIC_FUNDAMENTAL_COLS
         df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
         
         # Reset index to save 'date' as a column
@@ -394,8 +467,8 @@ def process_file(csv_path, output_path, df_fundamentals, sector_cols, df_global_
             df.to_csv(output_path, index=False)
 
     except Exception as e:
-        # Silently skip errors to avoid spam
-        pass
+        ticker = os.path.basename(csv_path).split("_")[0]
+        logging.warning(f"Skipping {ticker} ({os.path.basename(csv_path)}): {e}")
 
 # --- MAIN ---
 

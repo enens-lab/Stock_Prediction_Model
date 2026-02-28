@@ -13,16 +13,16 @@ PIPELINE = [
     # --- PHASE 1: DATA COLLECTION ---
     ("TrainingData/featuresPy/markets.py", "Fetching Global Macro Data (VIX, Oil, Rates)"),
     ("TrainingData/featuresPy/stockScrapper.py", "Smart-Updating Stock Prices (OHLCV)"),
-    ("options_flow.py", "Scraping Options Flow (Smart Money)"),
+    #("options_flow.py", "Scraping Options Flow (Smart Money)"),
     
     # --- PHASE 2: PROCESSING ---
     ("TrainingData/featuresPy/sentiment.py", "Updating News Sentiment (FinBERT)"),
-    #("TrainingData/processor.py", "Engineering Advanced Features (Options + Squeeze)"),
+    ("TrainingData/processor.py", "Engineering Advanced Features (Options + Squeeze)"),
     
     # --- PHASE 3: TRAINING (The Gym) ---
     # Comment these out if you are happy with your current models and just want to trade!
-    ("train_model.py", "Training Production Model (Target: >2% in 5 Days)"),
-    ("train_jackpot_model.py", "Training Jackpot Model (Target: >20% in 20 Days)"),
+    #("train_model.py", "Training Production Model (Target: >2% in 5 Days)"),
+    #("train_jackpot_model.py", "Training Jackpot Model (Target: >20% in 20 Days)"),
 ]
 
 def run_script(script_name, description):
